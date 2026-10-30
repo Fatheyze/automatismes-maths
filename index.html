@@ -1652,7 +1652,8 @@ def({ id: "python", th: "algo", lv: ["2de", "1re", "Tle"], label: "Lire un progr
 const KEY = "automaths.v1";
 const blank = () => ({ name: "", classe: "", level: "3e", stats: {}, time: 0, sessions: [], sel: {} });
 let S; try { S = Object.assign(blank(), JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) { S = blank(); }
-const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} };
+let nuageAM = null; // synchronisation de la progression entre vos appareils
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} if (nuageAM) nuageAM.modifie(); };
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const app = $("#app");
@@ -2025,6 +2026,88 @@ function classRun() {
 // Démarrage
 header(); home();
 
+/* ===== Synchronisation automatique (dépôt privé donnees-outils, clé commune à tous les outils) ===== */
+function creerNuage(opt){
+  const CLE = "nuage-github-cle", K_SHA = opt.id + "-sync-sha", K_SALE = opt.id + "-sync-sale";
+  const depot = {owner:"Fatheyze", repo:"donnees-outils", path:opt.fichier};
+  const jeton = () => { try { return localStorage.getItem(CLE) || ""; } catch(e){ return ""; } };
+  const enc = s => { const o = new TextEncoder().encode(s); let r = ""; for (let i = 0; i < o.length; i += 0x8000) r += String.fromCharCode.apply(null, o.subarray(i, i + 0x8000)); return btoa(r); };
+  const dec = b => new TextDecoder().decode(Uint8Array.from(atob(b.replace(/\s/g, "")), c => c.charCodeAt(0)));
+  const url = () => `https://api.github.com/repos/${depot.owner}/${depot.repo}`;
+  const entetes = () => ({"Authorization": "Bearer " + jeton().trim(), "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"});
+  const sale = () => { try { const v = localStorage.getItem(K_SALE); return v === null ? true : v === "1"; } catch(e){ return true; } };
+  const setSale = v => { try { localStorage.setItem(K_SALE, v ? "1" : "0"); } catch(e){} };
+  const erreur = st => st === 401 ? "GitHub refuse la clé (expirée ou mal copiée)." : st === 403 ? "cette clé n'a pas le droit d'écrire dans ce dépôt." : st === 404 ? "dépôt introuvable, ou la clé n'y a pas accès." : "erreur GitHub " + st + ".";
+  let enCours = false, relance = false, minuterie = null, priveOk = false, msg = "", ok = null;
+  const etat = (m, o) => { msg = m; ok = o; try { opt.etat && opt.etat(m, o); } catch(e){} };
+  async function synchroniser(){
+    if (!jeton()) { etat("Synchronisation non configurée sur cet appareil.", null); return; }
+    if (enCours) { relance = true; return; }
+    enCours = true; etat("Synchronisation en cours…", null);
+    try {
+      if (!priveOk){ const rd = await fetch(url() + "?t=" + Date.now(), {headers: entetes(), cache: "no-store"}); if (rd.status !== 200) throw new Error(erreur(rd.status)); if (!(await rd.json()).private) throw new Error("ce dépôt est public : envoi refusé pour protéger les données."); priveOk = true; }
+      for (let essai = 0; essai < 3; essai++){
+        const r = await fetch(url() + "/contents/" + encodeURIComponent(depot.path) + "?t=" + Date.now(), {headers: entetes(), cache: "no-store"});
+        let sha = null;
+        if (r.status === 200){
+          const j = await r.json(); sha = j.sha;
+          if (sha !== localStorage.getItem(K_SHA)){
+            const distant = JSON.parse(dec(j.content));
+            if (sale()) opt.appliquer(opt.fusionner(opt.lire(), distant)); else { opt.appliquer(distant); setSale(false); }
+            localStorage.setItem(K_SHA, sha);
+          }
+        } else if (r.status !== 404) throw new Error(erreur(r.status));
+        const heure = new Date().toLocaleTimeString("fr-FR", {hour: "2-digit", minute: "2-digit"});
+        if (!sale() || (!sha && opt.vide && opt.vide(opt.lire()))) { setSale(false); etat("Synchronisé à " + heure, true); return; }
+        const corps = {message: opt.nom + " : mise à jour du " + new Date().toLocaleString("fr-FR"), content: enc(JSON.stringify({...opt.lire(), version: 1, maj: new Date().toISOString()}))};
+        if (sha) corps.sha = sha;
+        const p = await fetch(url() + "/contents/" + encodeURIComponent(depot.path), {method: "PUT", headers: {...entetes(), "Content-Type": "application/json"}, body: JSON.stringify(corps)});
+        if (p.status === 200 || p.status === 201){ const o = await p.json(); localStorage.setItem(K_SHA, o.content.sha); setSale(false); etat("Synchronisé à " + heure, true); return; }
+        if (p.status === 409 || p.status === 422) continue;
+        throw new Error(erreur(p.status));
+      }
+      throw new Error("un autre appareil enregistre en même temps, réessayez.");
+    } catch(e){ etat("Synchronisation impossible : " + (e instanceof TypeError ? "pas de connexion à GitHub." : e.message) + " Vos données restent sur cet appareil.", false); }
+    finally { enCours = false; if (relance){ relance = false; synchroniser(); } }
+  }
+  const planifier = (d = 2000) => { if (!jeton()) return; clearTimeout(minuterie); minuterie = setTimeout(synchroniser, d); };
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") planifier(300); });
+  setInterval(() => { if (document.visibilityState === "visible") planifier(0); }, 120000);
+  if (jeton()) planifier(500);
+  return {
+    modifie(){ setSale(true); planifier(); },
+    synchroniser, jeton,
+    enregistrerCle(c){ try { localStorage.setItem(CLE, c.trim()); } catch(e){} priveOk = false; synchroniser(); },
+    effacerCle(){ try { localStorage.removeItem(CLE); } catch(e){} etat("Clé effacée de ce navigateur.", null); },
+    etat: () => ({msg, ok})
+  };
+}
+
+nuageAM = creerNuage({
+  id: "automaths", fichier: "automatismes-maths.json", nom: "Automatismes maths",
+  lire: () => JSON.parse(JSON.stringify(S)),
+  vide: o => !Object.keys(o.stats || {}).length && !(o.sessions || []).length,
+  fusionner: (l, d) => {
+    const stats = {...(d.stats || {})};
+    Object.entries(l.stats || {}).forEach(([k, v]) => { if (!stats[k] || (v.n || 0) >= (stats[k].n || 0)) stats[k] = v; });
+    const ses = new Map(); [...(d.sessions || []), ...(l.sessions || [])].forEach(x => ses.set(x.d, x));
+    return {...d, ...l, name: l.name || d.name || "", classe: l.classe || d.classe || "", stats, time: Math.max(l.time || 0, d.time || 0),
+      sessions: [...ses.values()].sort((a, b) => a.d - b.d).slice(-40), sel: {...(d.sel || {}), ...(l.sel || {})}};
+  },
+  appliquer: o => { const x = {...o}; delete x.version; delete x.maj; S = Object.assign(blank(), x); try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e){} if (!sess && document.getElementById("nuage-am")) home(); },
+  etat: (m, ok) => { const e = document.getElementById("nuage-am"); if (e){ e.textContent = "☁ " + m; e.style.color = ok === false ? "#ff9aa5" : ""; } }
+});
+{
+  const accueil = home;
+  home = function(){
+    accueil.apply(this, arguments);
+    const s = nuageAM.etat(), cle = nuageAM.jeton();
+    app.insertAdjacentHTML("beforeend", `<div style="max-width:900px;margin:18px auto 0;padding:0 16px;font-size:13px;opacity:.85">
+      <span id="nuage-am">☁ ${esc(s.msg || (cle ? "Synchronisation en cours…" : "Synchronisation non configurée sur cet appareil."))}</span>
+      ${cle ? "" : ` · <details style="display:inline"><summary style="display:inline;cursor:pointer;text-decoration:underline">synchroniser mes appareils</summary><p>Collez votre clé GitHub (la même que pour vos autres outils) : votre progression sera enregistrée dans votre dépôt privé « donnees-outils ».</p><input id="nuage-cle" type="password" autocomplete="off" placeholder="github_pat_…" style="padding:6px 10px;border-radius:8px"> <button onclick="const v=document.getElementById('nuage-cle').value.trim();if(v){nuageAM.enregistrerCle(v);home()}">Enregistrer</button></details>`}</div>`);
+  };
+}
+if (!sess) home(); // réaffiche l'accueil avec l'état de la synchronisation
 </script>
 </body>
 </html>
